@@ -1,1 +1,5 @@
+.gradle/
 .env
+node_modules/
+build/
+run/
