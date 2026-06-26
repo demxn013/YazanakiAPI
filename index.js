@@ -3,10 +3,17 @@ const cors    = require('cors');
 require('dotenv').config();
 
 const db  = require('./db');
+const { verifyMinecraftToken } = require('./mojangAuth');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// ── KenzAI internal endpoint (the single writer of points/cosmetics) ─────────
+// The launcher never writes the DB directly; we forward verified purchases to
+// KenzAI, which performs them with the same logic the Discord /shop uses.
+const KENZAI_INTERNAL_URL       = process.env.KENZAI_INTERNAL_URL || 'http://127.0.0.1:4825';
+const COSMETICS_INTERNAL_SECRET = process.env.COSMETICS_INTERNAL_SECRET || '';
 
 // ── Auth middleware ─────────────────────────────────────────────────────────
 // Every request must include X-API-Secret header matching .env value.
@@ -216,6 +223,78 @@ app.get('/catalog', async (req, res) => {
         res.json([]);
     }
 });
+
+// ── Cosmetic WRITES (launcher) ───────────────────────────────────────────────
+// Purchase / equip from the launcher. Auth is two-layered: the global
+// X-API-Secret (transport) PLUS the player's Minecraft access token (identity).
+// We verify the token with Mojang, confirm it matches the :username being acted
+// on, map that Minecraft account to its empire member, then forward to KenzAI
+// (the single writer) which performs the spend/grant and returns the new state.
+//
+// NOTE: identity maps by minecraft_user (no UUID column yet), so a player who
+// renamed their MC account and whose empire profile is stale won't resolve.
+
+async function resolveDiscordId(username) {
+    const [rows] = await db.execute(
+        'SELECT discord_id FROM members WHERE LOWER(minecraft_user) = LOWER(?) LIMIT 1',
+        [username]
+    );
+    return rows.length ? rows[0].discord_id : null;
+}
+
+async function forwardToKenzai(path, payload) {
+    if (!COSMETICS_INTERNAL_SECRET) {
+        return { status: 503, body: { ok: false, error: 'writes_disabled' } };
+    }
+    const resp = await fetch(KENZAI_INTERNAL_URL + path, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Secret': COSMETICS_INTERNAL_SECRET,
+        },
+        body: JSON.stringify(payload),
+    });
+    let body = null;
+    try { body = await resp.json(); } catch { /* leave null */ }
+    return { status: resp.status, body };
+}
+
+function cosmeticWriteHandler(internalPath) {
+    return async (req, res) => {
+        const username = req.params.username;
+        const { itemId, accessToken } = req.body || {};
+        if (!itemId || !accessToken) {
+            return res.status(400).json({ ok: false, error: 'missing_fields', message: 'itemId and accessToken are required.' });
+        }
+
+        // 1. Prove the caller actually owns this Minecraft account.
+        const profile = await verifyMinecraftToken(accessToken);
+        if (!profile) {
+            return res.status(401).json({ ok: false, error: 'invalid_token' });
+        }
+        // 2. That account must be the one named in the path.
+        if (profile.name.toLowerCase() !== String(username).toLowerCase()) {
+            return res.status(403).json({ ok: false, error: 'identity_mismatch' });
+        }
+        // 3. Map the verified Minecraft identity to an empire member.
+        const discordId = await resolveDiscordId(profile.name);
+        if (!discordId) {
+            return res.status(404).json({ ok: false, error: 'member_not_found' });
+        }
+        // 4. Let KenzAI perform the write and relay its result verbatim.
+        try {
+            const { status, body } = await forwardToKenzai(internalPath, { discordId, itemId });
+            return res.status(status).json(body ?? { ok: false, error: 'no_response' });
+        } catch (err) {
+            console.error('[cosmetic write]', err.message);
+            return res.status(502).json({ ok: false, error: 'kenzai_unreachable' });
+        }
+    };
+}
+
+app.post('/member/:username/purchase', cosmeticWriteHandler('/internal/purchase'));
+app.post('/member/:username/equip',    cosmeticWriteHandler('/internal/equip'));
+app.post('/member/:username/unequip',  cosmeticWriteHandler('/internal/unequip'));
 
 // ── GET /health ─────────────────────────────────────────────────────────────
 // Simple health check — the mod pings this on startup to verify connectivity.
